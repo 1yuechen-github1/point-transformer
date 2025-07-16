@@ -1,4 +1,5 @@
 import os
+from random import random
 
 import numpy as np
 import SharedArray as SA
@@ -26,12 +27,36 @@ class S3DIS(Dataset):
         self.data_idx = np.arange(len(self.data_list))
         print("Totally {} samples in {} set.".format(len(self.data_idx), split))
 
+    # def __getitem__(self, idx):
+    #     data_idx = self.data_idx[idx % len(self.data_idx)]
+    #     data = SA.attach("shm://{}".format(self.data_list[data_idx])).copy()
+    #     coord, feat, label = data[:, 0:3], data[:, 3:6], data[:, 6]
+    #     coord, feat, label = data_prepare(coord, feat, label, self.split, self.voxel_size, self.voxel_max, self.transform, self.shuffle_index)
+    #
+    #     # 在 __getitem__ 返回前添加检查
+    #     print("Label min/max:", label.min(), label.max())  # 应该在 [0, n_classes-1] 范围内
+    #     return coord, feat, label
+
     def __getitem__(self, idx):
-        data_idx = self.data_idx[idx % len(self.data_idx)]
-        data = SA.attach("shm://{}".format(self.data_list[data_idx])).copy()
-        coord, feat, label = data[:, 0:3], data[:, 3:6], data[:, 6]
-        coord, feat, label = data_prepare(coord, feat, label, self.split, self.voxel_size, self.voxel_max, self.transform, self.shuffle_index)
+        while True:  # 循环直到找到符合条件的sample
+            data_idx = self.data_idx[idx % len(self.data_idx)]
+            data = SA.attach("shm://{}".format(self.data_list[data_idx])).copy()
+            coord, feat, label = data[:, 0:3], data[:, 3:6], data[:, 6]
+            coord, feat, label = data_prepare(coord, feat, label, self.split, self.voxel_size, self.voxel_max,
+                                              self.transform, self.shuffle_index)
+
+            # 检查是否只包含背景（label=0）
+            if np.all(label == 0):
+                # 随机保留30%的背景samples
+                if random.random() < 0.3:  # 30%概率保留
+                    break
+                else:
+                    idx += 1  # 跳过当前sample，尝试下一个
+            else:
+                break  # 非全背景样本，直接返回
+
         return coord, feat, label
+
 
     def __len__(self):
         return len(self.data_idx) * self.loop
