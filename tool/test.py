@@ -17,6 +17,16 @@ from util import config
 from util.common_util import AverageMeter, intersectionAndUnion, check_makedirs
 from util.voxelize import voxelize
 
+from scipy.spatial.distance import directed_hausdorff
+from skimage.metrics import hausdorff_distance
+from sklearn.metrics import average_precision_score
+
+from sklearn.metrics import confusion_matrix
+import numpy as np
+from scipy.spatial.distance import directed_hausdorff
+from scipy import ndimage
+
+
 random.seed(123)
 np.random.seed(123)
 
@@ -78,7 +88,10 @@ def main():
 
 def data_prepare():
     if args.data_name == 's3dis':
-        data_list = sorted(os.listdir(args.data_root))
+        data_list = sorted(os.listdir(args.data_root_test))
+        data_list = [item[:-4] for item in data_list if 'Area_{}'.format(args.test_area) in item]
+    elif args.data_name == 'hostipal':
+        data_list = sorted(os.listdir(args.data_root_test))
         data_list = [item[:-4] for item in data_list if 'Area_{}'.format(args.test_area) in item]
     else:
         raise Exception('dataset not supported yet'.format(args.data_name))
@@ -87,7 +100,7 @@ def data_prepare():
 
 
 def data_load(data_name):
-    data_path = os.path.join(args.data_root, data_name + '.npy')
+    data_path = os.path.join(args.data_root_test, data_name + '.npy')
     data = np.load(data_path)  # xyzrgbl, N*7
     coord, feat, label = data[:, :3], data[:, 3:6], data[:, 6]
 
@@ -120,7 +133,18 @@ def test(model, criterion, names):
     target_meter = AverageMeter()
     args.batch_size_test = 10
     model.eval()
+# -----------------------
+    dice_scores = []
+    hd95_scores = []
+    asd_scores = []
+    ap_scores = []
 
+    pred_save_prob = []  # 新增：保存预测概率
+    pred_save_label = []  # 原来的pred_save改名为pred_save_label
+    label_save = []
+
+
+# -----------------------
     check_makedirs(args.save_folder)
     pred_save, label_save = [], []
     data_list = data_prepare()
@@ -128,6 +152,7 @@ def test(model, criterion, names):
         end = time.time()
         pred_save_path = os.path.join(args.save_folder, '{}_{}_pred.npy'.format(item, args.epoch))
         label_save_path = os.path.join(args.save_folder, '{}_{}_label.npy'.format(item, args.epoch))
+        # 判断预测和标签文件是否存在
         if os.path.isfile(pred_save_path) and os.path.isfile(label_save_path):
             logger.info('{}/{}: {}, loaded pred and label.'.format(idx + 1, len(data_list), item))
             pred, label = np.load(pred_save_path), np.load(label_save_path)
@@ -165,7 +190,8 @@ def test(model, criterion, names):
                 feat_part = torch.FloatTensor(np.concatenate(feat_part)).cuda(non_blocking=True)
                 offset_part = torch.IntTensor(np.cumsum(offset_part)).cuda(non_blocking=True)
                 with torch.no_grad():
-                    pred_part = model([coord_part, feat_part, offset_part])  # (n, k)
+                    pred_part = model([coord_part, feat_part, offset_part])  # (n, k)      
+
                 torch.cuda.empty_cache()
                 pred[idx_part, :] += pred_part
                 logger.info('Test: {}/{}, {}/{}, {}/{}'.format(idx + 1, len(data_list), e_i, len(idx_list), args.voxel_max, idx_part.shape[0]))
@@ -197,7 +223,7 @@ def test(model, criterion, names):
     mIoU1 = np.mean(iou_class)
     mAcc1 = np.mean(accuracy_class)
     allAcc1 = sum(intersection_meter.sum) / (sum(target_meter.sum) + 1e-10)
-
+    logging.info(f'Val1 result: mIoU/mAcc/allAcc {mIoU1:.4f}/{mAcc1:.4f}/{allAcc1:.4f}.')
     # calculation 2
     intersection, union, target = intersectionAndUnion(np.concatenate(pred_save), np.concatenate(label_save), args.classes, args.ignore_label)
     iou_class = intersection / (union + 1e-10)
@@ -208,9 +234,53 @@ def test(model, criterion, names):
     logger.info('Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(mIoU, mAcc, allAcc))
     logger.info('Val1 result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(mIoU1, mAcc1, allAcc1))
 
+# ------------------------------
+    all_pred = np.concatenate(pred_save)
+    all_label = np.concatenate(label_save)
+
+
+    # 忽略标签
+    valid_idx = all_label != args.ignore_label
+    all_pred = all_pred[valid_idx]
+    all_label = all_label[valid_idx]
+
+
+    # 计算混淆矩阵
+    cm = confusion_matrix(all_label, all_pred, labels=np.arange(args.classes))
+
+    for i in range(args.classes):
+        # Dice系数
+        intersection = cm[i,i]
+        union = cm[i,:].sum() + cm[:,i].sum()
+        dice = 2 * intersection / (union + 1e-10)
+        dice_scores.append(dice)
+
+    # 计算总体指标
+    mDice = np.mean(dice_scores)
+    mHD95 = np.mean(hd95_scores) if hd95_scores else 0
+    mASD = np.mean(asd_scores) if asd_scores else 0
+    # mAP = np.mean(ap_scores)
+    OA = sum(np.diag(cm)) / sum(cm.flatten())
+    
+    # 打印结果
+    logger.info('Additional Metrics:')
+    logger.info(f'mDice: {mDice:.4f}')
+    logger.info(f'mHD95: {mHD95:.4f}')
+    logger.info(f'mASD: {mASD:.4f}')
+    logger.info(f'OA: {OA:.4f}')
+    # logger.info(f'mAP: {mAP:.4f}')
+    
+    # 打印各类别Dice
+    for i in range(args.classes):
+        logger.info(f'Class_{i} Dice: {dice_scores[i]:.4f}, name: {names[i]}')
+# ------------------------------
+
+    
     for i in range(args.classes):
         logger.info('Class_{} Result: iou/accuracy {:.4f}/{:.4f}, name: {}.'.format(i, iou_class[i], accuracy_class[i], names[i]))
     logger.info('<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<')
+
+
 
 
 if __name__ == '__main__':
